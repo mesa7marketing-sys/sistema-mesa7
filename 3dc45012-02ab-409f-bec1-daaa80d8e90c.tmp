@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# Coloca o Sistema Mesa7 de volta no ar (em /opt/sistema-mesa7) com a versão
+# indicada, reaproveitando o .env do sistema que foi guardado em
+# /opt/mesa7-antigo-*. Não mexe no banco de dados nem apaga pastas.
+# Uso:  bash instalar-mesa7.sh v11
+set -euo pipefail
+
+VERSAO="${1:-v11}"
+ZIP="sistema-mesa7-source-$VERSAO.zip"
+REPO="mesa7marketing-sys/sistema-mesa7"
+DESTINO="/opt/sistema-mesa7"
+SITE="https://painel.mesa7.tech"
+
+echo; echo "=== Instalando o Sistema Mesa7 $VERSAO em $DESTINO ==="
+
+# 1) Sistema antigo guardado (de onde vem o .env com banco e login)
+ANTIGO="${ANTIGO:-$(ls -d /opt/mesa7-antigo-* 2>/dev/null | sort | tail -1 || true)}"
+if [ -z "$ANTIGO" ] || [ ! -f "$ANTIGO/.env" ] || ! grep -q '"name": "sistema-mesa7"' "$ANTIGO/package.json" 2>/dev/null; then
+  echo "[ERRO] Não achei o Sistema Mesa7 guardado em /opt/mesa7-antigo-* (com .env). Nada foi alterado."; exit 1
+fi
+echo "Configuração (.env) vem de: $ANTIGO"
+
+# 2) Porta que o Nginx usa para painel.mesa7.tech
+PORTA="${PORTA:-$(nginx -T 2>/dev/null | awk '/server_name/ && /painel\.mesa7\.tech/{f=1} f && /proxy_pass/{ if (match($0,/:[0-9]+/)) { print substr($0,RSTART+1,RLENGTH-1); exit } }' || true)}"
+if [ -z "$PORTA" ]; then
+  echo "[ERRO] Não achei no Nginx para qual porta o painel.mesa7.tech aponta."
+  echo "Rode:  nginx -T | grep -B3 -A15 painel.mesa7.tech   e mande o resultado para o Claude."; exit 1
+fi
+if ss -ltn | grep -q ":$PORTA "; then
+  echo "[ERRO] Já tem outro programa usando a porta $PORTA. Rode: ss -ltnp | grep :$PORTA  e mande para o Claude."; exit 1
+fi
+echo "Porta do painel no Nginx: $PORTA"
+
+# 3) Banco de dados no ar?
+systemctl is-active --quiet postgresql || { echo "Ligando o PostgreSQL..."; systemctl start postgresql; }
+
+# 4) Baixa o zip do GitHub
+TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+if [ -n "${ZIP_LOCAL:-}" ]; then cp "$ZIP_LOCAL" "$TMP/$ZIP"; else
+  read -rsp "Cole o token do GitHub e aperte Enter (ele não aparece na tela): " TOKEN; echo
+  HTTP=$(curl -sSL -w '%{http_code}' -o "$TMP/$ZIP" -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github.raw" "https://api.github.com/repos/$REPO/contents/$ZIP" || true)
+  unset TOKEN
+  [ "$HTTP" = "200" ] || { echo "[ERRO] Não consegui baixar $ZIP do GitHub (código $HTTP). Confira o nome do zip e o token."; exit 1; }
+fi
+echo "Zip baixado."
+command -v unzip >/dev/null || { echo "Instalando unzip..."; apt-get install -y unzip >/dev/null; }
+mkdir -p "$TMP/novo"; unzip -q "$TMP/$ZIP" -d "$TMP/novo"
+grep -q '"name": "sistema-mesa7"' "$TMP/novo/package.json" 2>/dev/null && [ -d "$TMP/novo/src" ] || { echo "[ERRO] O zip não parece ser do Sistema Mesa7. Nada foi alterado."; exit 1; }
+
+# 5) Monta a pasta nova (se já existir, guarda a anterior com data)
+if [ -e "$DESTINO" ]; then mv "$DESTINO" "$DESTINO-anterior-$(date +%Y%m%d-%H%M%S)"; fi
+mkdir -p "$DESTINO"
+cp -a "$TMP/novo/." "$DESTINO/"
+cp -a "$ANTIGO/.env" "$DESTINO/.env"
+
+# 6) Instala, compila e liga no PM2
+cd "$DESTINO"
+echo "Instalando dependências (1 a 3 minutos)..."; npm ci --no-audit --no-fund
+echo "Compilando..."; npm run build
+pm2 delete sistema-mesa7 >/dev/null 2>&1 || true
+PORT="$PORTA" pm2 start npm --name sistema-mesa7 --cwd "$DESTINO" -- start
+pm2 save >/dev/null 2>&1 || true
+
+# 7) Confere
+sleep 5
+LOCAL=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORTA/login" || true)
+PUBLICO=$(curl -s -o /dev/null -w '%{http_code}' "$SITE/login" || true)
+echo
+if [ "$LOCAL" = "200" ] && [ "$PUBLICO" = "200" ]; then
+  echo "=== Pronto! Sistema Mesa7 $VERSAO no ar ==="; echo "Abra: $SITE/dashboards"
+else
+  echo "[ATENÇÃO] Resposta local $LOCAL, site $PUBLICO. Rode 'pm2 logs sistema-mesa7 --lines 50' e mande para o Claude."
+fi
+echo "Próximas versões: bash /root/atualizar-mesa7.sh v12"
